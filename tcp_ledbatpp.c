@@ -7,9 +7,7 @@
  *
  * You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>. 
  *
- * It is based on the LEDBAT implementation by Silvio Valenti
- *
- * Updated by Qian Li to conform to LEDBAT++ draft version 01
+ * The code conforms to LEDBAT++ draft version 01
  * 
  */
 
@@ -20,19 +18,18 @@
 #include <linux/minmax.h>
 #include <linux/time64.h>
 
-// init cwnd can be set with: sudo ip route add dst_ip/24 via next_hop_ip dev eth0 initcwnd 2 //
-
 #define MIN_CWND 2
-// length of base history in minutes
+// length of base history, in minutes
 #define BASE_HISTORY_LEN 10
-// length of current delay filter in number of samples
+// length of current delay filter, in number of samples
 #define DELAY_FILTER_LEN 4
-// target delay in ms
+// target delay, in ms
 #define TARGET 60
 // decrease constant
 #define C 1
 #define MAX_RTT 0xffffffff
- 
+
+// this struct and its related operations are borrowed from the source code of LEDBAT written by Silvio Valenti
 struct circular_buffer {
 	u32 *buffer;
 	u8 first;
@@ -44,14 +41,14 @@ struct circular_buffer {
 struct ledbatpp {
 	struct circular_buffer base_delay_history;
 	struct circular_buffer cur_delay_filter;
-	u64 cur_sld_start; // current slow down start time in ms
-	u64 schd_sld_start; // scheduled slow down start time in ms
-	u64 minute_start; // last rollover in ms
-	u32 undo_cwnd; // storing latest cwnd 
-    u32 snd_nxt; // sequence number of the next packet being sent at the beginning of cwnd reduction. used to mark RTT
+	u64 cur_sld_start; // current slow down start, in ms
+	u64 schd_sld_start; // scheduled slow down start, in ms
+	u64 minute_start; // last rollover, in ms
+	u32 undo_cwnd; // storing the latest cwnd 
+    u32 snd_nxt; // sequence number of the next packet to be sent at the start of cwnd reduction
     u32 dec_quota; // max allowed cwnd reduction per RTT
-    s32 accrued_dec_bytes; // accrued window decrease in the unit of bytes, it can be negative sometimes
-    bool can_ss; // if the flow should do slow start or CA
+    s32 accrued_dec_bytes; // accrued bytes that should be decreased from cwnd
+    bool can_ss; // if LEDBAT++ is allowed to do slow start
 };
 
 static int init_circular_buffer(struct circular_buffer *cb, u16 len)
@@ -100,7 +97,7 @@ static void tcp_ledbatpp_init(struct sock *sk)
 
 typedef u32 (*filter_function) (struct circular_buffer *);
 
-// implements the filter_function above
+// implementing the filter_function above
 static u32 min_filter(struct circular_buffer *cb)
 {
 	if (cb->first == cb->last) // empty buffer
@@ -118,54 +115,50 @@ static u32 get_base_delay(struct ledbatpp *ledbatpp)
 	return min_filter(&ledbatpp->base_delay_history);
 }
 
-// invoked at the time of loss, used by both duplicate ack and rto losses
 static u32 tcp_ledbatpp_ssthresh(struct sock *sk)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
-	struct inet_sock *inet = inet_sk(sk);
 
 	return max_t(u32, tp->snd_cwnd >> 1U, MIN_CWND);
 }
 
-// invoked after loss recovery
 static void tcp_ledbatpp_cwnd_event(struct sock *sk, enum tcp_ca_event ev)
 {
-	struct inet_sock *inet = inet_sk(sk);
 	struct ledbatpp *ledbatpp = inet_csk_ca(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
+	s32 idle;
 	
 	if(!ledbatpp->base_delay_history.buffer) // not initialized properly
 		return;
+	
 	switch (ev) {
-	case CA_EVENT_CWND_RESTART: // after idle, cwnd is restarted
-		tp->snd_cwnd_cnt = 0;
-		ledbatpp->accrued_dec_bytes = 0;
-		ledbatpp->snd_nxt = 0;
-		ledbatpp->dec_quota = 0;
-		ledbatpp->can_ss = true;
-		break;
-	case CA_EVENT_COMPLETE_CWR: // after fast retransmit and fast recovery
-		tp->snd_cwnd_cnt = 0;
-		ledbatpp->accrued_dec_bytes = 0;
-		ledbatpp->snd_nxt = 0;
-		ledbatpp->dec_quota = 0;
+	case CA_EVENT_CWND_RESTART: // after idle
 		ledbatpp->can_ss = false;
-		break;
+		if (READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_slow_start_after_idle)) {
+			idle = tcp_jiffies32 - tp->lsndtime;
+			if (idle > inet_csk(sk)->icsk_rto) {
+				ledbatpp->can_ss = true;
+			}
+		}
+		goto out;
+	case CA_EVENT_COMPLETE_CWR: // after fast retransmit and fast recovery
+		ledbatpp->can_ss = false;
+		goto out;
 	case CA_EVENT_LOSS: // rto timer timeout
-		tp->snd_cwnd_cnt = 0;
-		ledbatpp->accrued_dec_bytes = 0;
-		ledbatpp->snd_nxt = 0;
-		ledbatpp->dec_quota = 0;
 		ledbatpp->can_ss = true;
-		break;
+		goto out;
 	default:
-		break;
+		return;
 	}
+	out:
+	tp->snd_cwnd_cnt = 0;
+	ledbatpp->accrued_dec_bytes = 0;
+	ledbatpp->snd_nxt = 0;
+	ledbatpp->dec_quota = 0;
 }
 
 static bool ledbatpp_ai(struct sock *sk, u32 w, u32 acked)
 {
-	struct inet_sock *inet = inet_sk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	struct ledbatpp *ledbatpp = inet_csk_ca(sk);
 	u32 cwnd = 0, delta, diff, ca = false;
@@ -189,16 +182,16 @@ static bool ledbatpp_ai(struct sock *sk, u32 w, u32 acked)
     return ca;
 }
 
-// ledbat++'s own slow start
+// modified slow start
 static bool ledbatpp_slow_start(struct sock *sk, u32 acked, u32 inversed_gain, u32 queue_delay, u32 base_delay)
 {
 	struct ledbatpp *ledbatpp = inet_csk_ca(sk);
-	struct inet_sock *inet = inet_sk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u64 now_ms;
 	bool ca;
 	
-	if (tcp_in_initial_slowstart(tp) && queue_delay > (TARGET * 3 >> 2)) { // quit initial slow start due to delay is large
+	if (tcp_in_initial_slowstart(tp) && queue_delay > (TARGET * 3 >> 2)) { 
+		// quit initial slow start because delay exceeds threshold
 		tp->snd_ssthresh = tp->snd_cwnd;
 		ledbatpp->can_ss = false;
 		// schedule the initial slow down
@@ -210,27 +203,23 @@ static bool ledbatpp_slow_start(struct sock *sk, u32 acked, u32 inversed_gain, u
 	
     ca = ledbatpp_ai(sk, inversed_gain, acked);
 	
-	// end of slow start, update slow down start time
-	if (tp->snd_cwnd >= tp->snd_ssthresh) { // quit slow start due to ssthresh reached
-		ledbatpp->can_ss = false;
-		now_ms = div_u64(tcp_clock_ns(), NSEC_PER_MSEC);
-		if (tcp_in_initial_slowstart(tp)) {
-			ledbatpp->schd_sld_start = now_ms + (tp->srtt_us >> 2) / USEC_PER_MSEC;
-		} else { // end of non-initial slow start 
-			ledbatpp->schd_sld_start = now_ms + (now_ms - ledbatpp->cur_sld_start) * 9;
-			ledbatpp->cur_sld_start = 0;
-			ledbatpp->accrued_dec_bytes = 0;
-			ledbatpp->snd_nxt = 0;
-			ledbatpp->dec_quota = 0;
-		} 
-	} 
+    if (tp->snd_cwnd >= tp->snd_ssthresh) { 
+    	// quit slow start
+    	ledbatpp->can_ss = false;
+    	// schedule the next slow down
+    	now_ms = div_u64(tcp_clock_ns(), NSEC_PER_MSEC);
+    	ledbatpp->schd_sld_start = now_ms + (now_ms - ledbatpp->cur_sld_start) * 9;
+    	ledbatpp->cur_sld_start = 0;
+    	ledbatpp->accrued_dec_bytes = 0;
+    	ledbatpp->snd_nxt = 0;
+    	ledbatpp->dec_quota = 0;
+    } 
     return ca;
 }
 
 static void ledbatpp_decrease_cwnd(struct sock * sk, int off_target, u32 inversed_gain) 
 {
 	struct ledbatpp *ledbatpp = inet_csk_ca(sk);
-	struct inet_sock *inet = inet_sk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	int dec_p, allw_dec_p;
 	
@@ -252,7 +241,6 @@ static void ledbatpp_decrease_cwnd(struct sock * sk, int off_target, u32 inverse
 static void tcp_ledbatpp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 {
 	struct ledbatpp *ledbatpp = inet_csk_ca(sk);
-	struct inet_sock *inet = inet_sk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	u64 now_ms;
 	u32 current_delay, base_delay, queue_delay, inversed_gain;
@@ -273,11 +261,15 @@ static void tcp_ledbatpp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 	now_ms = div_u64(tcp_clock_ns(), NSEC_PER_MSEC);
 	
-	if (ledbatpp->cur_sld_start) { // in slow down
-		if (now_ms - ledbatpp->cur_sld_start <= (tp->srtt_us >> 2) / USEC_PER_MSEC) { // stay in slow down for 2 RTTs
+	if (ledbatpp->cur_sld_start) { 
+		// in slow down
+		if (now_ms - ledbatpp->cur_sld_start <= (tp->srtt_us >> 2) / USEC_PER_MSEC) { 
+			// staying in slow down for 2 RTTs
 			return;
-		} else { // quit slow down
-			if (tp->snd_cwnd >= tp->snd_ssthresh) { // subsequent slow start quited with loss
+		} else { 
+			// having stayed in slow down for long enough time
+			if (tp->snd_cwnd >= tp->snd_ssthresh) { 
+				// end of slow start after slow down or loss occured during slow down
 				ledbatpp->can_ss = false;
 				ledbatpp->schd_sld_start = now_ms + (now_ms - ledbatpp->cur_sld_start) * 9;
 				ledbatpp->cur_sld_start = 0;
@@ -285,11 +277,12 @@ static void tcp_ledbatpp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 				ledbatpp->snd_nxt = 0;
 				ledbatpp->dec_quota = 0;
 				tp->snd_cwnd_cnt = 0;
-			} else { // do slow start
-			}
+			} 
 		}
-	} else { // not in slow down
-		if (ledbatpp->schd_sld_start && now_ms >= ledbatpp->schd_sld_start) { // should slow down
+	} else { 
+		// not in slow down
+		if (ledbatpp->schd_sld_start && now_ms >= ledbatpp->schd_sld_start) { 
+			// it is time to slow down
 			tp->snd_ssthresh = tp->snd_cwnd;
 			tp->snd_cwnd = MIN_CWND;
 			ledbatpp->undo_cwnd = tp->snd_cwnd;
@@ -299,7 +292,8 @@ static void tcp_ledbatpp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 			tp->snd_cwnd_cnt = 0;
 			return;
 		}
-		if (!ledbatpp->schd_sld_start && tp->snd_cwnd >= tp->snd_ssthresh) { // initial slow start quited with loss
+		if (!ledbatpp->schd_sld_start && tp->snd_cwnd >= tp->snd_ssthresh) { 
+			// initial slow start quited with loss
 			ledbatpp->can_ss = false;
 			ledbatpp->schd_sld_start = now_ms + (tp->srtt_us >> 2) / USEC_PER_MSEC;
 			ledbatpp->cur_sld_start = 0;
@@ -312,25 +306,31 @@ static void tcp_ledbatpp_cong_avoid(struct sock *sk, u32 ack, u32 acked)
 
 	queue_delay = current_delay - base_delay;
 	off_target = TARGET - queue_delay;
+	// inversed_gain = F
 	inversed_gain = min_t(u32, 16, DIV_ROUND_UP(2 * TARGET, base_delay)); 
 	
-	if (tcp_in_slow_start(tp) && ledbatpp->can_ss) { // do slow start 
+	if (tcp_in_slow_start(tp) && ledbatpp->can_ss) { 
+		// do slow start 
         ca = ledbatpp_slow_start(sk, acked, inversed_gain, queue_delay, base_delay);
 		if(!ca) {
             return;
 		} else {
-            acked = 0; // all acked packets have been added to tp->snd_cwnd_cnt
+			// all acked packets have been added to tp->snd_cwnd_cnt
+            acked = 0; 
 		}
 	}
 
 	// congestion avoidance
-	if (off_target >= 0) { // increase cwnd
+	if (off_target >= 0) { 
+		// increase cwnd
         ledbatpp_ai(sk, tp->snd_cwnd * inversed_gain, acked);
         ledbatpp->accrued_dec_bytes = 0;
         ledbatpp->snd_nxt = 0;
         ledbatpp->dec_quota = 0;
-	} else { // decrease cwnd
-		if (ack >= ledbatpp->snd_nxt) { // a new rtt has began, update decrease quota, etc.
+	} else { 
+		// decrease cwnd
+		if (ack >= ledbatpp->snd_nxt) { 
+			// initializing cwnd reduction at the start of an RTT
 			ledbatpp->snd_nxt = tp->snd_nxt;
 			ledbatpp->dec_quota = tp->snd_cwnd >> 1;
 			ledbatpp->accrued_dec_bytes = 0;
@@ -345,25 +345,20 @@ static void add_delay(struct circular_buffer *cb, u32 rtt)
 	u8 i;
 
 	if (cb->last == cb->first) {
-		/*buffer is empty */
 		cb->buffer[cb->last] = rtt;
 		cb->min = cb->last;
 		cb->last++;
 		return;
 	}
 
-	/*insert the new delay */
 	cb->buffer[cb->last] = rtt;
-	/* update the min if it is the case */
 	if (rtt < cb->buffer[cb->min])
 		cb->min = cb->last;
 
-	/* increase the last pointer */
 	cb->last = (cb->last + 1) % cb->len;
 
 	if (cb->last == cb->first) {
 		if (cb->min == cb->first) {
-			/* Discard the min, search a new one */
 			cb->min = i = (cb->first + 1) % cb->len;
 			while (i != cb->last) {
 				if (cb->buffer[i] < cb->buffer[cb->min])
@@ -371,7 +366,6 @@ static void add_delay(struct circular_buffer *cb, u32 rtt)
 				i = (i + 1) % cb->len;
 			}
 		}
-		/* move the first */
 		cb->first = (cb->first + 1) % cb->len;
 	}
 }
@@ -390,17 +384,14 @@ static void update_base_delay(struct ledbatpp *ledbatpp, u32 rtt)
 		ledbatpp->minute_start = now_ms;
 
 	if (cb->last == cb->first) {
-		/* empty circular buffer */
 		add_delay(cb, rtt);
 		return;
 	}
 
 	if (now_ms - ledbatpp->minute_start > 60 * MSEC_PER_SEC) {
-		/* we have finished a minute */
 		ledbatpp->minute_start = now_ms;
 		add_delay(cb, rtt);
 	} else {
-		/* update the last value and the min if it is the case */
 		last = (cb->last + cb->len - 1) % cb->len;
 		if (rtt < cb->buffer[last]) {
 			cb->buffer[last] = rtt;
@@ -413,8 +404,6 @@ static void update_base_delay(struct ledbatpp *ledbatpp, u32 rtt)
 static void tcp_ledbatpp_pkts_acked(struct sock *sk, const struct ack_sample *sample)
 {
 	struct ledbatpp *ledbatpp = inet_csk_ca(sk);
-	struct inet_sock *inet = inet_sk(sk);
-	struct tcp_sock *tp = tcp_sk(sk);
 	u32 rtt_ms;
 	
 	if(!ledbatpp->base_delay_history.buffer) // not initialized properly
@@ -431,10 +420,10 @@ static void tcp_ledbatpp_pkts_acked(struct sock *sk, const struct ack_sample *sa
 static u32 tcp_ledbatpp_undo_cwnd(struct sock *sk)
 {
 	struct ledbatpp *ledbatpp = inet_csk_ca(sk);
-	struct inet_sock *inet = inet_sk(sk);
 	struct tcp_sock *tp = tcp_sk(sk);
 	
-	if(!ledbatpp->base_delay_history.buffer) { // not initialized properly
+	if(!ledbatpp->base_delay_history.buffer) { 
+		// not initialized properly
 		return max(tp->snd_cwnd, tp->prior_cwnd);
 	}
 	
@@ -471,4 +460,4 @@ module_exit(tcp_ledbatpp_unregister);
 
 MODULE_AUTHOR("Qian Li");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("TCP Ledbat Plus Plus");
+MODULE_DESCRIPTION("TCP LEDBAT Plus Plus");
